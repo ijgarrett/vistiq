@@ -22,6 +22,7 @@ dependencies = [
     "typer",
     "prefect>=3.0.0",
     "bioio>=3.0.0",
+    "bioio-lif",
     "bioio-ome-tiff>=1.4.0",
     "bioio-tifffile",
 ]
@@ -48,6 +49,7 @@ notebook = [
 napari = [
     "PyQt6<6.9",
     "napari[pyqt6,optional]>=0.7",
+    "napari-animation",
 ]
 
 all = [
