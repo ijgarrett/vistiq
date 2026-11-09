@@ -25,6 +25,7 @@ from vistiq.utils import check_device
 
 from full_pipeline import (
     DEFAULT_EMBEDDING_PATH,
+    add_tissue_gaussian_argument,
     parse_channel_list,
     run_full_pipeline,
 )
@@ -99,6 +100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "lobe labels to 3D; 3d segments the full volume (default: 2d)"
         ),
     )
+    add_tissue_gaussian_argument(parser)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -151,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             tissue_labels_mode=args.tissue_labels,
             channel_names=channel_names,
             channels_from_filename=args.channels_from_filename,
+            tissue_gaussian=args.tissue_gaussian,
         )
     except Exception:
         logger.exception("Full pipeline failed for %s", input_path)

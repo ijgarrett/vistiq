@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import logging
 import os
 import sys
@@ -149,6 +150,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "and uses stricter cross-sectional area filters on all planes (default: 2d)"
         ),
     )
+    add_tissue_gaussian_argument(parser)
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -236,8 +238,32 @@ def discover_image_files(
     return [path.resolve() for path in files if path.is_file()]
 
 
-def _base_tissue_preprocessors() -> list:
-    """Shared tissue preprocessors from hierarchical-analysis-gwas.ipynb."""
+def add_tissue_gaussian_argument(parser: argparse.ArgumentParser) -> None:
+    """Add ``--tissue-gaussian/--no-tissue-gaussian`` (shared by both CLIs)."""
+    parser.add_argument(
+        "--tissue-gaussian",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply the Gaussian smoothing step (sigma=1) in tissue/lobe "
+            "preprocessing. Use --no-tissue-gaussian to skip only that step; "
+            "other tissue steps and cell preprocessing are unchanged (default: on)"
+        ),
+    )
+
+
+def _base_tissue_preprocessors(tissue_gaussian: bool = True) -> list:
+    """Shared tissue preprocessors from hierarchical-analysis-gwas.ipynb.
+
+    ``tissue_gaussian=False`` omits only the ``skimage.filters.gaussian`` step.
+    """
+    gaussian = [
+        FuncProcessorConfig(
+            func="skimage.filters.gaussian",
+            kwargs={"sigma": 1.0},
+            iterator_config=ArrayIteratorConfig(slice_def=(-2, -1)),
+        )
+    ]
     return [
         RescaleConfig(
             low=2,
@@ -245,11 +271,7 @@ def _base_tissue_preprocessors() -> list:
             dtype=np.uint8,
             iterator_config=ArrayIteratorConfig(slice_def=(-3, -2, -1)),
         ),
-        FuncProcessorConfig(
-            func="skimage.filters.gaussian",
-            kwargs={"sigma": 1.0},
-            iterator_config=ArrayIteratorConfig(slice_def=(-2, -1)),
-        ),
+        *(gaussian if tissue_gaussian else []),
         FuncProcessorConfig(
             func="skimage.exposure.adjust_gamma",
             kwargs={"gamma": 0.2},
@@ -272,9 +294,13 @@ def _base_tissue_preprocessors() -> list:
     ]
 
 
-def build_tissue_preprocess_config(mode: TissueLabelsMode) -> PreprocessFlowConfig:
+def build_tissue_preprocess_config(
+    mode: TissueLabelsMode,
+    *,
+    tissue_gaussian: bool = True,
+) -> PreprocessFlowConfig:
     """Build tissue preprocess config for 2D or 3D lobe segmentation."""
-    processors = _base_tissue_preprocessors()
+    processors = _base_tissue_preprocessors(tissue_gaussian=tissue_gaussian)
     if mode == "2d":
         processors.append(
             FuncProcessorConfig(
@@ -372,10 +398,10 @@ def build_analysis_config() -> AnalysisFlowConfig:
             map_axes=True,
         ),
         hierarchy_builder=HierarchyBuilderConfig(orphan_strategy="drop"),
+        # output_type/annotate moved to AnalysisFlowConfig.matrix_formatter
+        # (default: output_type="dataframe", annotate=True) in 635372c.
         overlap_calculator=LabelOverlapCalculatorConfig(
             metrics_calculators=[IoSMetricsCalculatorConfig()],
-            output_type="dataframe",
-            annotate=True,
             triangle=FULL,
         ),
         overlap_filter=ValueFilterConfig(
@@ -431,6 +457,79 @@ def build_organ_label(tissue_labels: np.ndarray) -> np.ndarray:
     for i in range(len(brain_mask)):
         brain_mask[i] = binary_dilation(brain_mask[i], iterations=1)
     return (brain_mask * 1).astype(np.uint16)
+
+
+def _config_record(cfg: Any) -> Any:
+    """JSON-friendly dump of a pydantic config (falls back to ``str``)."""
+    def plain(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {str(k): plain(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [plain(v) for v in obj]
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        if callable(obj) and hasattr(obj, "__name__"):  # functions, numpy dtypes
+            return f"{getattr(obj, '__module__', '')}.{obj.__name__}"
+        return str(obj)
+
+    if hasattr(cfg, "model_dump"):
+        # serialize_as_any: keep subclass fields (func, kwargs, range, model_type)
+        # of polymorphic sub-configs instead of only the base-class fields.
+        return plain(cfg.model_dump(serialize_as_any=True))
+    return str(cfg)
+
+
+def _step_name(cfg: Any) -> str:
+    func = getattr(cfg, "func", None)
+    if func is None:
+        return type(cfg).__name__
+    return f"{getattr(func, '__module__', '')}.{getattr(func, '__name__', func)}"
+
+
+def write_run_settings(
+    outdir: Path,
+    img_path: Path,
+    scene_index: int,
+    *,
+    settings: dict[str, Any],
+    configs: dict[str, Any],
+) -> Path:
+    """Write the effective run settings next to the label outputs."""
+    import importlib.metadata as im
+    import platform
+
+    versions = {}
+    for pkg in ("vistiq", "micro_sam", "torch", "numpy", "scikit-image", "prefect"):
+        try:
+            versions[pkg] = im.version(pkg)
+        except im.PackageNotFoundError:
+            versions[pkg] = None
+    try:
+        import torch
+
+        versions["torch_cuda"] = torch.version.cuda
+        versions["gpu"] = (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        )
+    except Exception:  # pragma: no cover - informational only
+        pass
+    record = {
+        "input": str(img_path),
+        "scene_index": scene_index,
+        "settings": settings,
+        "tissue_preprocess_steps": [
+            _step_name(p) for p in configs["tissue_preprocess"].processors
+        ],
+        "configs": {name: _config_record(cfg) for name, cfg in configs.items()},
+        "versions": versions,
+        "python": platform.python_version(),
+        "host": platform.node(),
+    }
+    outdir.mkdir(parents=True, exist_ok=True)
+    path = outdir / f"{img_path.stem}.scene-{scene_index}.run_settings.json"
+    path.write_text(json.dumps(record, indent=2, default=str))
+    logger.info("Wrote run settings to %s", path)
+    return path
 
 
 def save_outputs(
@@ -500,8 +599,13 @@ def run_full_pipeline(
     tissue_labels_mode: TissueLabelsMode = "2d",
     channel_names: list[str] | None = None,
     channels_from_filename: bool = False,
+    tissue_gaussian: bool = True,
 ) -> dict[str, Path]:
-    """Run the GWAS notebook pipeline for a single image file."""
+    """Run the GWAS notebook pipeline for a single image file.
+
+    ``tissue_gaussian=False`` skips only the Gaussian step of tissue
+    preprocessing (cell preprocessing is unaffected).
+    """
     img_path = img_path.expanduser().resolve()
     embedding_path = embedding_path.expanduser().resolve()
     if outdir is None:
@@ -529,12 +633,36 @@ def run_full_pipeline(
         channels_from_filename=channels_from_filename,
     )
 
-    logger.info("Tissue labels mode: %s", tissue_labels_mode)
-    tissue_ppcfg = build_tissue_preprocess_config(tissue_labels_mode)
+    logger.info(
+        "Tissue labels mode: %s; tissue Gaussian: %s", tissue_labels_mode, tissue_gaussian
+    )
+    tissue_ppcfg = build_tissue_preprocess_config(
+        tissue_labels_mode, tissue_gaussian=tissue_gaussian
+    )
     tsfcfg = build_tissue_segmentation_config(embedding_path, tissue_labels_mode)
     cell_ppcfg = build_cell_preprocess_config()
     cell_sfcfg = build_cell_segmentation_config(embedding_path)
     acfg = build_analysis_config()
+    run_settings_path = write_run_settings(
+        outdir,
+        img_path,
+        scene_index,
+        settings={
+            "tissue_labels_mode": tissue_labels_mode,
+            "tissue_gaussian": tissue_gaussian,
+            "channel_names": metadata.get("channel_names"),
+            "embedding_path": str(embedding_path),
+            "preprocess_workers": preprocess_workers,
+            "segment_workers": segment_workers,
+            "image_shape": list(img.shape),
+        },
+        configs={
+            "tissue_preprocess": tissue_ppcfg,
+            "tissue_segmentation": tsfcfg,
+            "cell_preprocess": cell_ppcfg,
+            "cell_segmentation": cell_sfcfg,
+        },
+    )
 
     logger.info("Preprocessing tissue")
     tissue_img, tissue_metadata = PreprocessFlow(tissue_ppcfg).run(
@@ -613,6 +741,7 @@ def run_full_pipeline(
         img_path=img_path,
         outdir=outdir,
     )
+    outputs["run_settings"] = run_settings_path
     logger.info("Wrote outputs for %s to %s", img_path.name, outdir)
     return outputs
 
@@ -693,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
                 tissue_labels_mode=args.tissue_labels,
                 channel_names=channel_names,
                 channels_from_filename=args.channels_from_filename,
+                tissue_gaussian=args.tissue_gaussian,
             )
         except Exception as exc:
             logger.exception("Full pipeline failed for %s", image_path)
